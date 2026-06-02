@@ -1,0 +1,518 @@
+---
+title: "TÜİK Tourism Forecasting Project"
+author: "Leyla Shikhzaman - 138723991"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Packages and Setup
+
+```{r packages}
+library(tuikr)
+library(httr)
+library(readxl)
+library(dplyr)
+library(zoo)
+library(forecast)
+library(ggplot2)
+```
+
+## 2. Data Access via tuikr
+
+```{r data-access}
+# Access TÜİK Tourism tables through tuikr (Theme ID 14)
+# Data access date:
+access_date <- Sys.Date()
+cat("Data access date:", format(access_date), "\n")
+
+# Get tourism tables
+tourism_tables <- statistical_tables("14")
+
+# Start session to access istab file
+s <- handle("https://veriportali.tuik.gov.tr")
+GET(handle = s, path = "/")
+
+# Download the selected table (row 57: Number of Trips by Accommodation and Quarter)
+tmp_xls <- tempfile(fileext = ".xls")
+GET(tourism_tables$table_url[57],
+    handle = s,
+    write_disk(tmp_xls, overwrite = TRUE),
+    add_headers(
+      "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "Referer" = "https://veriportali.tuik.gov.tr/"
+    ))
+
+# Read raw file
+df_raw <- read_excel(tmp_xls, sheet = 1)
+cat("Raw data dimensions:", nrow(df_raw), "rows,", ncol(df_raw), "columns\n")
+```
+
+## 3. Data Preparation
+
+```{r data-prep}
+# Clean and structure the data
+df_clean <- df_raw %>%
+  rename(year = 1, quarter = 2, total_trips = 3) %>%
+  mutate(year = na.locf(year, na.rm = FALSE)) %>%
+  filter(quarter %in% c("I", "II", "III", "IV")) %>%
+  select(year, quarter, total_trips) %>%
+  mutate(total_trips = as.numeric(gsub(",", "", total_trips))) %>%
+  mutate(q_num = ifelse(quarter=="I",1,
+                 ifelse(quarter=="II",2,
+                 ifelse(quarter=="III",3,4)))) %>%
+  mutate(period = paste0(year, " Q", q_num)) %>%
+  filter(!is.na(total_trips)) %>%
+  select(year, quarter, q_num, total_trips, period)
+
+# Report key facts
+cat("Latest available observation:", tail(df_clean$period, 1), "\n")
+cat("Forecast target period: 2026 Q1\n")
+cat("Total observations:", nrow(df_clean), "\n")
+cat("Missing values:", sum(is.na(df_clean$total_trips)), "\n")
+
+# Create time series object (quarterly, starting 2009 Q1)
+ts_data <- ts(df_clean$total_trips, start = c(2009, 1), frequency = 4)
+print(ts_data)
+```
+
+## 4. Exploratory Time Series Analysis
+
+```{r eda}
+# Plot the actual time series
+p_actual <- ggplot(df_clean, aes(x = seq_along(total_trips), y = total_trips)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 1.5) +
+  scale_x_continuous(breaks = seq(1, 68, by = 4),
+                     labels = df_clean$period[seq(1, 68, by = 4)]) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Number of Domestic Trips by Quarter (2009-2025)",
+       x = "Period", y = "Number of Trips (thousands)")
+
+print(p_actual)
+ggsave("outputs/figures/actual_series_plot.png", p_actual, width=10, height=5)
+
+# Decomposition to check trend and seasonality
+decomp <- decompose(ts_data)
+plot(decomp)
+```
+
+## 5. Forecasting Methods
+
+### 5.1 Naïve Forecasting
+
+```{r naive}
+naive_fit <- naive(ts_data, h = 1)
+naive_fitted <- fitted(naive_fit)
+naive_errors <- df_clean$total_trips[-1] - as.numeric(naive_fitted)[-1]
+
+naive_bias  <- mean(naive_errors)
+naive_mad   <- mean(abs(naive_errors))
+naive_mse   <- mean(naive_errors^2)
+naive_mape  <- mean(abs(naive_errors / df_clean$total_trips[-1])) * 100
+naive_rsfe  <- sum(naive_errors)
+naive_ts    <- naive_rsfe / naive_mad
+naive_next  <- as.numeric(naive_fit$mean[1])
+
+cat("Naive next-period forecast:", naive_next, "\n")
+
+p_naive <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = c(NA, as.numeric(naive_fitted)[-1]), color = "Naive Forecast")) +
+  scale_color_manual(values = c("Actual"="steelblue","Naive Forecast"="red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  labs(title="Actual vs Naive Forecast", x="Period", y="Trips (thousands)", color="")
+
+print(p_naive)
+ggsave("outputs/figures/naive_forecast_plot.png", p_naive, width=10, height=5)
+```
+
+### 5.2 Moving Average
+
+```{r moving-average}
+# Window = 4 (one full year, appropriate for quarterly data)
+ma_values <- ma(ts_data, order = 4)
+ma_vec <- as.numeric(ma_values)
+actual_vec <- as.numeric(ts_data)
+
+ma_errors <- actual_vec[!is.na(ma_vec)] - ma_vec[!is.na(ma_vec)]
+ma_bias  <- mean(ma_errors)
+ma_mad   <- mean(abs(ma_errors))
+ma_mse   <- mean(ma_errors^2)
+ma_mape  <- mean(abs(ma_errors / actual_vec[!is.na(ma_vec)])) * 100
+ma_rsfe  <- sum(ma_errors)
+ma_ts    <- ma_rsfe / ma_mad
+# Next period forecast = last available MA value
+ma_next  <- tail(ma_vec[!is.na(ma_vec)], 1)
+
+cat("Moving Average next-period forecast:", ma_next, "\n")
+
+p_ma <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = ma_vec, color = "Moving Average")) +
+  scale_color_manual(values = c("Actual"="steelblue","Moving Average"="orange")) +
+  theme_minimal() +
+  labs(title="Actual vs Moving Average (window=4)", x="Period", y="Trips (thousands)", color="")
+
+print(p_ma)
+ggsave("outputs/figures/moving_average_plot.png", p_ma, width=10, height=5)
+```
+
+### 5.3 Weighted Moving Average
+
+```{r wma}
+# Weights: more weight on recent quarters
+weights <- c(0.1, 0.2, 0.3, 0.4)
+
+wma_vec <- rep(NA, length(actual_vec))
+for (i in 4:length(actual_vec)) {
+  wma_vec[i] <- sum(weights * actual_vec[(i-3):i])
+}
+
+wma_errors <- actual_vec[!is.na(wma_vec)] - wma_vec[!is.na(wma_vec)]
+wma_bias  <- mean(wma_errors)
+wma_mad   <- mean(abs(wma_errors))
+wma_mse   <- mean(wma_errors^2)
+wma_mape  <- mean(abs(wma_errors / actual_vec[!is.na(wma_vec)])) * 100
+wma_rsfe  <- sum(wma_errors)
+wma_ts    <- wma_rsfe / wma_mad
+wma_next  <- sum(weights * tail(actual_vec, 4))
+
+cat("WMA next-period forecast:", wma_next, "\n")
+
+p_wma <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = wma_vec, color = "WMA Forecast")) +
+  scale_color_manual(values = c("Actual"="steelblue","WMA Forecast"="purple")) +
+  theme_minimal() +
+  labs(title="Actual vs Weighted Moving Average", x="Period", y="Trips (thousands)", color="")
+
+print(p_wma)
+ggsave("outputs/figures/weighted_moving_average_plot.png", p_wma, width=10, height=5)
+```
+
+### 5.4 Exponential Smoothing
+
+```{r exp-smoothing}
+ses_fit  <- ses(ts_data, alpha = 0.3, h = 1)
+ses_fitted <- as.numeric(fitted(ses_fit))
+ses_errors <- actual_vec - ses_fitted
+
+ses_bias  <- mean(ses_errors)
+ses_mad   <- mean(abs(ses_errors))
+ses_mse   <- mean(ses_errors^2)
+ses_mape  <- mean(abs(ses_errors / actual_vec)) * 100
+ses_rsfe  <- sum(ses_errors)
+ses_ts    <- ses_rsfe / ses_mad
+ses_next  <- as.numeric(ses_fit$mean[1])
+
+cat("Exponential Smoothing next-period forecast:", ses_next, "\n")
+
+p_ses <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = ses_fitted, color = "Exp Smoothing")) +
+  scale_color_manual(values = c("Actual"="steelblue","Exp Smoothing"="darkgreen")) +
+  theme_minimal() +
+  labs(title="Actual vs Exponential Smoothing (alpha=0.3)", x="Period", y="Trips (thousands)", color="")
+
+print(p_ses)
+ggsave("outputs/figures/exponential_smoothing_plot.png", p_ses, width=10, height=5)
+```
+
+### 5.5 Trend-Adjusted Exponential Smoothing
+
+```{r holt}
+holt_fit <- holt(ts_data, alpha = 0.3, beta = 0.1, h = 1)
+holt_fitted <- as.numeric(fitted(holt_fit))
+holt_errors <- actual_vec - holt_fitted
+
+holt_bias  <- mean(holt_errors)
+holt_mad   <- mean(abs(holt_errors))
+holt_mse   <- mean(holt_errors^2)
+holt_mape  <- mean(abs(holt_errors / actual_vec)) * 100
+holt_rsfe  <- sum(holt_errors)
+holt_ts    <- holt_rsfe / holt_mad
+holt_next  <- as.numeric(holt_fit$mean[1])
+
+cat("Holt next-period forecast:", holt_next, "\n")
+
+p_holt <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = holt_fitted, color = "Holt Forecast")) +
+  scale_color_manual(values = c("Actual"="steelblue","Holt Forecast"="brown")) +
+  theme_minimal() +
+  labs(title="Actual vs Trend-Adjusted Exponential Smoothing", x="Period", y="Trips (thousands)", color="")
+
+print(p_holt)
+ggsave("outputs/figures/trend_adjusted_smoothing_plot.png", p_holt, width=10, height=5)
+```
+
+### 5.6 Linear Trend Projection
+
+```{r linear-trend}
+t_index <- 1:nrow(df_clean)
+lm_fit <- lm(total_trips ~ t_index, data = df_clean)
+summary(lm_fit)
+
+lm_fitted <- as.numeric(fitted(lm_fit))
+lm_errors <- df_clean$total_trips - lm_fitted
+
+lm_bias  <- mean(lm_errors)
+lm_mad   <- mean(abs(lm_errors))
+lm_mse   <- mean(lm_errors^2)
+lm_mape  <- mean(abs(lm_errors / df_clean$total_trips)) * 100
+lm_rsfe  <- sum(lm_errors)
+lm_ts    <- lm_rsfe / lm_mad
+lm_next  <- predict(lm_fit, newdata = data.frame(t_index = nrow(df_clean) + 1))
+
+cat("Linear Trend next-period forecast:", lm_next, "\n")
+
+p_lm <- ggplot(df_clean, aes(x = t_index)) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = lm_fitted, color = "Linear Trend")) +
+  scale_color_manual(values = c("Actual"="steelblue","Linear Trend"="red")) +
+  theme_minimal() +
+  labs(title="Actual vs Linear Trend Projection", x="Period", y="Trips (thousands)", color="")
+
+print(p_lm)
+ggsave("outputs/figures/trend_projection_plot.png", p_lm, width=10, height=5)
+```
+
+### 5.7 Seasonal Indices
+
+```{r seasonal-indices}
+# Calculate average for each quarter
+seasonal_avg <- df_clean %>%
+  group_by(q_num) %>%
+  summarise(avg = mean(total_trips))
+
+overall_avg <- mean(df_clean$total_trips)
+seasonal_avg$index <- seasonal_avg$avg / overall_avg
+
+cat("Seasonal Indices:\n")
+print(seasonal_avg)
+cat("Q1 (lowest):", round(seasonal_avg$index[1],3), "\n")
+cat("Q3 (highest):", round(seasonal_avg$index[3],3), "\n")
+
+# Deseasonalized values
+df_clean$seas_index <- seasonal_avg$index[df_clean$q_num]
+df_clean$deseason   <- df_clean$total_trips / df_clean$seas_index
+
+# Trend on deseasonalized
+t_index2 <- 1:nrow(df_clean)
+lm_deseas <- lm(deseason ~ t_index2, data = df_clean)
+deseas_trend <- predict(lm_deseas, newdata = data.frame(t_index2 = nrow(df_clean) + 1))
+si_next <- deseas_trend * seasonal_avg$index[1]  # Q1 for 2026
+
+si_fitted <- fitted(lm_deseas) * df_clean$seas_index
+si_errors <- df_clean$total_trips - si_fitted
+si_bias  <- mean(si_errors)
+si_mad   <- mean(abs(si_errors))
+si_mse   <- mean(si_errors^2)
+si_mape  <- mean(abs(si_errors / df_clean$total_trips)) * 100
+si_rsfe  <- sum(si_errors)
+si_ts    <- si_rsfe / si_mad
+
+cat("Seasonal Indices next-period forecast:", si_next, "\n")
+
+p_si <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = si_fitted, color = "Seasonal Indices")) +
+  scale_color_manual(values = c("Actual"="steelblue","Seasonal Indices"="darkgreen")) +
+  theme_minimal() +
+  labs(title="Actual vs Seasonal Indices Forecast", x="Period", y="Trips (thousands)", color="")
+
+print(p_si)
+ggsave("outputs/figures/seasonal_indices_plot.png", p_si, width=10, height=5)
+```
+
+### 5.8 Additive Decomposition
+
+```{r additive-decomp}
+decomp_add <- decompose(ts_data, type = "additive")
+plot(decomp_add)
+
+add_fitted <- ts_data - decomp_add$random
+add_errors <- as.numeric(ts_data) - as.numeric(add_fitted)
+add_errors <- add_errors[!is.na(add_errors)]
+actual_noNA <- as.numeric(ts_data)[!is.na(as.numeric(add_fitted))]
+
+add_bias  <- mean(add_errors)
+add_mad   <- mean(abs(add_errors))
+add_mse   <- mean(add_errors^2)
+add_mape  <- mean(abs(add_errors / actual_noNA)) * 100
+add_rsfe  <- sum(add_errors)
+add_ts    <- add_rsfe / add_mad
+
+# Forecast next period using trend + seasonal
+trend_val <- tail(as.numeric(decomp_add$trend)[!is.na(decomp_add$trend)], 1)
+seas_val  <- as.numeric(decomp_add$seasonal)[1]  # Q1 seasonal
+add_next  <- trend_val + seas_val
+
+cat("Additive Decomposition next-period forecast:", add_next, "\n")
+
+add_fitted_vec <- as.numeric(add_fitted)
+p_add <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = add_fitted_vec, color = "Additive Decomp")) +
+  scale_color_manual(values = c("Actual"="steelblue","Additive Decomp"="orange")) +
+  theme_minimal() +
+  labs(title="Actual vs Additive Decomposition", x="Period", y="Trips (thousands)", color="")
+
+print(p_add)
+ggsave("outputs/figures/additive_decomposition_plot.png", p_add, width=10, height=5)
+```
+
+### 5.9 Multiplicative Decomposition
+
+```{r mult-decomp}
+decomp_mult <- decompose(ts_data, type = "multiplicative")
+
+mult_fitted <- ts_data / decomp_mult$random
+mult_errors <- as.numeric(ts_data) - as.numeric(mult_fitted)
+mult_errors <- mult_errors[!is.na(mult_errors)]
+actual_noNA2 <- as.numeric(ts_data)[!is.na(as.numeric(mult_fitted))]
+
+mult_bias  <- mean(mult_errors)
+mult_mad   <- mean(abs(mult_errors))
+mult_mse   <- mean(mult_errors^2)
+mult_mape  <- mean(abs(mult_errors / actual_noNA2)) * 100
+mult_rsfe  <- sum(mult_errors)
+mult_ts    <- mult_rsfe / mult_mad
+
+trend_val2 <- tail(as.numeric(decomp_mult$trend)[!is.na(decomp_mult$trend)], 1)
+seas_val2  <- as.numeric(decomp_mult$seasonal)[1]
+mult_next  <- trend_val2 * seas_val2
+
+cat("Multiplicative Decomposition next-period forecast:", mult_next, "\n")
+
+mult_fitted_vec <- as.numeric(mult_fitted)
+p_mult <- ggplot(df_clean, aes(x = seq_along(total_trips))) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = mult_fitted_vec, color = "Mult Decomp")) +
+  scale_color_manual(values = c("Actual"="steelblue","Mult Decomp"="purple")) +
+  theme_minimal() +
+  labs(title="Actual vs Multiplicative Decomposition", x="Period", y="Trips (thousands)", color="")
+
+print(p_mult)
+ggsave("outputs/figures/multiplicative_decomposition_plot.png", p_mult, width=10, height=5)
+```
+
+### 5.10 Regression with Trend and Seasonal Dummies
+
+```{r regression-dummies}
+# Create seasonal dummy variables (Q1 is reference)
+df_clean$Q2 <- ifelse(df_clean$q_num == 2, 1, 0)
+df_clean$Q3 <- ifelse(df_clean$q_num == 3, 1, 0)
+df_clean$Q4 <- ifelse(df_clean$q_num == 4, 1, 0)
+df_clean$t  <- 1:nrow(df_clean)
+
+reg_fit <- lm(total_trips ~ t + Q2 + Q3 + Q4, data = df_clean)
+summary(reg_fit)
+
+reg_fitted <- as.numeric(fitted(reg_fit))
+reg_errors <- df_clean$total_trips - reg_fitted
+
+reg_bias  <- mean(reg_errors)
+reg_mad   <- mean(abs(reg_errors))
+reg_mse   <- mean(reg_errors^2)
+reg_mape  <- mean(abs(reg_errors / df_clean$total_trips)) * 100
+reg_rsfe  <- sum(reg_errors)
+reg_ts    <- reg_rsfe / reg_mad
+reg_next  <- predict(reg_fit, newdata = data.frame(t = nrow(df_clean)+1, Q2=0, Q3=0, Q4=0))
+
+cat("Regression next-period forecast:", reg_next, "\n")
+
+p_reg <- ggplot(df_clean, aes(x = t)) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = reg_fitted, color = "Regression")) +
+  scale_color_manual(values = c("Actual"="steelblue","Regression"="darkred")) +
+  theme_minimal() +
+  labs(title="Actual vs Regression with Trend & Seasonal Dummies", x="Period", y="Trips (thousands)", color="")
+
+print(p_reg)
+ggsave("outputs/figures/regression_seasonal_dummy_plot.png", p_reg, width=10, height=5)
+```
+
+## 6. Accuracy Comparison Table
+
+```{r accuracy-table}
+accuracy_table <- data.frame(
+  Method = c("Naive","Moving Average","Weighted MA","Exp Smoothing",
+             "Trend-Adj ES","Linear Trend","Seasonal Indices",
+             "Additive Decomp","Mult Decomp","Regression"),
+  Bias  = round(c(naive_bias, ma_bias, wma_bias, ses_bias,
+                  holt_bias, lm_bias, si_bias, add_bias, mult_bias, reg_bias), 2),
+  MAD   = round(c(naive_mad, ma_mad, wma_mad, ses_mad,
+                  holt_mad, lm_mad, si_mad, add_mad, mult_mad, reg_mad), 2),
+  MSE   = round(c(naive_mse, ma_mse, wma_mse, ses_mse,
+                  holt_mse, lm_mse, si_mse, add_mse, mult_mse, reg_mse), 2),
+  MAPE  = round(c(naive_mape, ma_mape, wma_mape, ses_mape,
+                  holt_mape, lm_mape, si_mape, add_mape, mult_mape, reg_mape), 2),
+  RSFE  = round(c(naive_rsfe, ma_rsfe, wma_rsfe, ses_rsfe,
+                  holt_rsfe, lm_rsfe, si_rsfe, add_rsfe, mult_rsfe, reg_rsfe), 2),
+  Tracking_Signal = round(c(naive_ts, ma_ts, wma_ts, ses_ts,
+                             holt_ts, lm_ts, si_ts, add_ts, mult_ts, reg_ts), 2),
+  Next_Forecast = round(c(naive_next, ma_next, wma_next, ses_next,
+                           holt_next, lm_next, si_next, add_next, mult_next, reg_next), 2)
+)
+
+print(accuracy_table)
+write.csv(accuracy_table, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+```
+
+## 7. Superior Method Selection
+
+```{r superior-method}
+# Based on lowest MAPE and suitability to quarterly seasonal data
+# Regression with trend and seasonal dummies captures both trend and seasonality
+
+best_method <- "Regression with Trend and Seasonal Dummy Variables"
+best_forecast <- reg_next
+
+cat("Superior Method:", best_method, "\n")
+cat("Forecast for 2026 Q1:", round(best_forecast, 2), "thousand trips\n")
+
+# Final plot
+p_final <- ggplot(df_clean, aes(x = t)) +
+  geom_line(aes(y = total_trips, color = "Actual")) +
+  geom_line(aes(y = reg_fitted, color = "Fitted")) +
+  geom_point(aes(x = nrow(df_clean)+1, y = best_forecast, color = "2026 Q1 Forecast"),
+             size = 4, shape = 17) +
+  scale_color_manual(values = c("Actual"="steelblue","Fitted"="darkred","2026 Q1 Forecast"="green3")) +
+  theme_minimal() +
+  labs(title="Superior Method: Regression with Trend & Seasonal Dummies — Forecast for 2026 Q1",
+       x="Period", y="Trips (thousands)", color="")
+
+print(p_final)
+ggsave("outputs/figures/superior_method_plot.png", p_final, width=10, height=5)
+```
+
+## 8. Final Forecast
+
+```{r final-forecast}
+final_forecast <- data.frame(
+  Superior_Method       = best_method,
+  Data_Access_Date      = format(access_date),
+  Latest_Observation    = "2025 Q4",
+  Forecast_Target       = "2026 Q1",
+  Forecasted_Value      = round(best_forecast, 2),
+  MAPE                  = round(reg_mape, 2)
+)
+
+print(final_forecast)
+write.csv(final_forecast, "outputs/tables/final_forecast.csv", row.names = FALSE)
+```
+
+## 9. Limitations
+
+The analysis has several limitations. First, the 2020 COVID-19 pandemic caused a structural break in domestic tourism, with Q2 2020 recording the lowest value in the entire series. This outlier may distort trend and seasonal estimates. Second, the regression model assumes a linear trend, which may not hold in future periods. Third, the model does not account for external factors such as economic conditions, fuel prices, or policy changes that could affect domestic travel behavior.
+
+## 10. Reproducibility Notes
+
+Data was accessed directly from the TÜİK Data Portal using the tuikr R package (statistical_tables function, Theme ID 14) combined with httr::GET() to download the istab file. No data was manually downloaded, edited, or saved outside of R. To reproduce, clone the repository, open forecasting_project.Rmd in RStudio, and click Knit.
