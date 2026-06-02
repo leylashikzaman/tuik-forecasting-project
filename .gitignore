@@ -1,4 +1,11 @@
+IBM/
+*.docx
+*.rtf
+desktop.ini
+MIS_FORM*
+Staj*
+password*
+*.txt
 .Rhistory
 .RData
 .Rproj.user/
-*.DS_Store
