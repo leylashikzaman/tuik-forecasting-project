@@ -85,6 +85,8 @@ The forecast for 2026 Q1 reflects the historically low first-quarter demand for 
 No manual data preparation is required. Data is fetched live from TÜİK at knit time.
 
 ## 13. Repository Structure
+
+```
 tuik-forecasting-project/
 ├── README.md
 ├── forecasting_project.Rmd
@@ -113,3 +115,4 @@ tuik-forecasting-project/
 │   └── plots.R
 ├── renv.lock
 └── .gitignore
+```
